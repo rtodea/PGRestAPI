@@ -254,7 +254,7 @@ exports.app = function (passport) {
   //Load PG Tables
   //look thru all tables in PostGres with a geometry column, spin up dynamic map tile services for each one
   //common.vacuumAnalyzeAll();
-
+  var updateThings = exports.updateThings = function(app) {
   common.findSpatialTables(app, function (error, tables) {
     if (error) {
       console.log(error);
@@ -299,7 +299,14 @@ exports.app = function (passport) {
       }
     }
   });
+  };
 
+  updateThings(app);
+  app.get('/update', function (req, res) {
+    res.writeHead(200, { 'Content-Type': 'text/plain'});
+    updateThings(app);
+    res.end('Updated endpoints');
+  });
   var sessionStart = new Date().toLocaleString();
 
   //Load tile rendering statistics
@@ -1610,6 +1617,6 @@ var createVectorTileRoute = exports.createVectorTileRoute = flow.define(
       }
     });
 
-    console.log("Created vector tile service: " + route);
+    console.log("Created vector tile service [tracing]: " + route);
     VectorTileRoutes.push({ name: _self.settings.routeProperties.name, route: route, type: "Multi Tile", source: _self.settings.routeProperties.source});
   });
