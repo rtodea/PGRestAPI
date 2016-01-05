@@ -1622,6 +1622,6 @@ var createVectorTileRoute = exports.createVectorTileRoute = flow.define(
       }
     });
 
-    console.log("Created vector tile service [tracing]: " + route);
+    console.log("Created vector tile service: " + route);
     VectorTileRoutes.push({ name: _self.settings.routeProperties.name, route: route, type: "Multi Tile", source: _self.settings.routeProperties.source});
   });
