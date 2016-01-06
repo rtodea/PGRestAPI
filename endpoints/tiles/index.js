@@ -74,6 +74,34 @@ if (mapnik.register_default_input_plugins)
 //var maps = mappool.create_pool(10);
 //TODO: Determine the best value for this
 
+var createTileSettings = function(key, item, settings) {
+  var tileSettings = { mapnik_datasource: {}, tileSize: { height: 256, width: 256}, routeProperties: { name: "", source: "", geom_field: "", srid: "", cartoFile: "" }};
+
+  tileSettings.mapnik_datasource = {
+    'host': settings.pg.server,
+    'port': settings.pg.port,
+    'dbname': settings.pg.database,
+    //'table': item.table,
+    'table': ('(SELECT ' + item.geometry_column + ' from "' + item.table + '"' + ') as "' + item.table + '"'),
+
+    'user': settings.pg.username,
+    'password': settings.pg.password,
+    'type': 'postgis',
+    'estimate_extent': 'false',
+    'geometry_field': item.geometry_column,
+    'srid': item.srid,
+    'geometry_type': item.type
+  };
+  tileSettings.routeProperties.name = key;
+  tileSettings.routeProperties.table = item.table;
+  tileSettings.routeProperties.srid = item.srid;
+  tileSettings.routeProperties.cartoFile = "";
+  tileSettings.routeProperties.source = "postgis";
+  tileSettings.routeProperties.geom_field = item.geometry_column;
+  tileSettings.routeProperties.defaultStyle = "";//The name of the style inside of the xml file
+
+  return tileSettings;
+};
 
 exports.app = function (passport) {
 
@@ -254,7 +282,6 @@ exports.app = function (passport) {
   //Load PG Tables
   //look thru all tables in PostGres with a geometry column, spin up dynamic map tile services for each one
   //common.vacuumAnalyzeAll();
-
   common.findSpatialTables(app, function (error, tables) {
     if (error) {
       console.log(error);
@@ -265,40 +292,18 @@ exports.app = function (passport) {
 
           (function (item) {
 
-            var tileSettings = { mapnik_datasource: {}, tileSize: { height: 256, width: 256}, routeProperties: { name: "", source: "", geom_field: "", srid: "", cartoFile: "" }};
-
-            tileSettings.mapnik_datasource = {
-              'host': settings.pg.server,
-              'port': settings.pg.port,
-              'dbname': settings.pg.database,
-              //'table': item.table,
-              'table': ('(SELECT ' + item.geometry_column + ' from "' + item.table + '"' + ') as "' + item.table + '"'),
-
-              'user': settings.pg.username,
-              'password': settings.pg.password,
-              'type': 'postgis',
-              'estimate_extent': 'false',
-              'geometry_field': item.geometry_column,
-              'srid': item.srid,
-              'geometry_type': item.type
-            };
-            tileSettings.routeProperties.name = key;
-            tileSettings.routeProperties.table = item.table;
-            tileSettings.routeProperties.srid = item.srid;
-            tileSettings.routeProperties.cartoFile = "";
-            tileSettings.routeProperties.source = "postgis";
-            tileSettings.routeProperties.geom_field = item.geometry_column;
-            tileSettings.routeProperties.defaultStyle = "";//The name of the style inside of the xml file
-
+            var tileSettings = createTileSettings(key, item, settings);
             createMultiTileRoute(app, tileSettings, PGTileStats.MultiTiles);
             createSingleTileRoute(app, tileSettings, PGTileStats.SingleTiles);
-            createVectorTileRoute(app, tileSettings, PGTileStats.VectorTiles);
+            //createVectorTileRoute(app, tileSettings, PGTileStats.VectorTiles);
 
           })(item);
         });
       }
     }
   });
+  createDynamicVectorTileRoute(app, PGTileStats.VectorTiles);
+
 
   var sessionStart = new Date().toLocaleString();
 
@@ -1439,12 +1444,167 @@ var createSingleTileRoute = exports.createSingleTileRoute = flow.define(
 
 
 //Generic implementation of vector tiles
+var generateTile = function (options, req, res) {
+  //Start Timer to measure response speed for tile requests.
+  var startTime = Date.now();
+
+  var args = common.getArguments(req);
+
+  //If user passes in where clause or fields, then build the query here and set it with the table property of postgis_setting
+  if (args.fields || args.where) {
+    //Validate where - TODO
+
+    //If a where clause was passed in, and we're using a postgis datasource, allow it
+    if (options.settings.mapnik_datasource.type.toLowerCase() == 'postgis') {
+      options.settings.mapnik_datasource.table = (args.fields ? '(SELECT ' + options.settings.routeProperties.geom_field + (args.fields ? ',' + args.fields : '') + ' from "' + options.settings.routeProperties.table + '"' + (args.where ? ' WHERE ' + args.where : '') + ') as "' + options.settings.routeProperties.table + '"' : '"' + options.settings.routeProperties.table + '"');
+    }
+  }
+
+  //Make the mapnik datasource.  We wait until now in case the table definition changes if a where clause is passed in above.
+  options.mapnikDatasource = (options.settings.mapnik_datasource.describe ? options.settings.mapnik_datasource : new mapnik.Datasource(options.settings.mapnik_datasource));
+
+  try {
+    //create map
+    var map = new mapnik.Map(256, 256, mercator.proj4);
+
+    var layer = new mapnik.Layer(options.settings.routeProperties.name, ((options.epsg && (options.epsg == 3857 || options.epsg == 3587)) ? mercator.proj4 : geographic.proj4));
+
+    var label_point_layer;
+    if(args.labelpoints && options.settings.mapnik_datasource.type.toLowerCase() == 'postgis') {
+      //If user specifies label points to be created, then create another layer in this vector tile that stores the centroid to use as a label point.
+
+      //The only difference in the datasource is the table parameter, which is either a table name, or a sub query that allows you specify a WHERE clause.
+      options.settings.mapnik_datasource.table = (args.fields ? '(SELECT ' + ('ST_PointOnSurface(' + options.settings.routeProperties.geom_field + ') as geom' ) + (args.fields ? ',' + args.fields : '')  + ' from "' + options.settings.routeProperties.table + '"' + (args.where ? ' WHERE ' + args.where : '') + ') as "' + options.settings.routeProperties.table + "_label" + '"' : '"' + options.settings.routeProperties.table + '"');
+
+      //Make a new Mapnik datasource object
+      options.mapnikDatasource_label = (options.settings.mapnik_datasource.describe ? options.settings.mapnik_datasource : new mapnik.Datasource(options.settings.mapnik_datasource));
+
+
+      label_point_layer = new mapnik.Layer(options.settings.routeProperties.name + "_label", ((options.epsg && (options.epsg == 3857 || options.epsg == 3587)) ? mercator.proj4 : geographic.proj4));
+      label_point_layer.datasource = options.mapnikDatasource_label;
+      label_point_layer.styles = [options.settings.routeProperties.table, 'default'];
+
+      //Add label layer
+      map.add_layer(label_point_layer);
+    }
+
+    var bbox = mercator.xyz_to_envelope(+req.param('x'), +req.param('y'), +req.param('z'), false);
+
+    layer.datasource = options.mapnikDatasource;
+    layer.styles = [options.settings.routeProperties.table, 'default'];
+
+    map.bufferSize = 10;
+
+    map.add_layer(layer);
+
+    console.log(map.toXML());
+
+    //From Tilelive-Bridge - getTile
+    // set source _maxzoom cache to prevent repeat calls to map.parameters
+    if (options._maxzoom === undefined) {
+      options._maxzoom = map.parameters.maxzoom ? parseInt(map.parameters.maxzoom, 10) : 14;
+    }
+
+    var opts = {};
+    // use tolerance of 32 for zoom levels below max
+    opts.tolerance = req.param('z') < options._maxzoom ? 32 : 0;
+    // make larger than zero to enable
+    opts.simplify = 0;
+    // 'radial-distance', 'visvalingam-whyatt', 'zhao-saalfeld' (default)
+    opts.simplify_algorithm = 'radial-distance';
+
+    res.setHeader('Content-Type', 'application/x-protobuf');
+
+    map.extent = bbox;
+    // also pass buffer_size in options to be forward compatible with recent node-mapnik
+    // https://github.com/mapnik/node-mapnik/issues/175
+    opts.buffer_size = map.bufferSize;
+
+    map.render(new mapnik.VectorTile(+req.param('z'), +req.param('x'), +req.param('y')), opts, function (err, image) {
+
+      if (err || !image) {
+        res.removeHeader('Content-Encoding');
+        res.writeHead(500, {
+          'Content-Type': 'application/x-protobuf'
+        });
+        res.end();
+        return;
+      }
+
+      // Fake empty RGBA to the rest of the tilelive API for now.
+      image.isSolid(function (err, solid, key) {
+        if (err) {
+          res.writeHead(500, {
+            'Content-Type': 'text/plain'
+          });
+
+          res.end(err.message);
+          return;
+        }
+        // Solid handling.
+        var done = function (err, buffer) {
+          if (err) {
+            res.writeHead(500, {
+              'Content-Type': 'text/plain'
+            });
+
+            res.end(err.message);
+            return;
+          }
+
+          if (solid === false) {
+            var duration = Date.now() - startTime;
+            options.performanceObject.times.push(duration);
+
+            res.send(buffer); //return response
+            return;
+          }
+
+          // Empty tiles are equivalent to no tile.
+          if (options._blank || !key) {
+            res.removeHeader('Content-Encoding');
+            res.writeHead(404, {
+              'Content-Type': 'application/octet-stream'
+            });
+
+
+            res.end(); //new Buffer('Tile is blank or does not exist', "utf-8")
+            return;
+          }
+
+          // Fake a hex code by md5ing the key.
+          var mockrgb = crypto.createHash('md5').update(buffer).digest('hex').substr(0, 6);
+          buffer.solid = [parseInt(mockrgb.substr(0, 2), 16), parseInt(mockrgb.substr(2, 2), 16), parseInt(mockrgb.substr(4, 2), 16), 1].join(',');
+          res.send(buffer);
+
+        };
+
+        //Compress if they ask for it.
+        if(res.req.headers["accept-encoding"] && res.req.headers["accept-encoding"].indexOf("gzip") > -1){
+          res.setHeader('content-encoding', 'gzip');
+          zlib.gzip(image.getData(), done);
+        }else{
+          done(null, image.getData());
+        }
+      });
+    });
+
+  } catch (err) {
+    res.writeHead(500, {
+      'Content-Type': 'text/plain'
+    });
+
+    res.end(err.message);
+  }
+
+};
+
 var createVectorTileRoute = exports.createVectorTileRoute = flow.define(
   function (app, routeSettings, performanceObject) {
 
     this.app = app;
     this.settings = routeSettings;
-    this.performanceObject = performanceObject
+    this.performanceObject = performanceObject;
     this();
   },
   function () {
@@ -1455,161 +1615,25 @@ var createVectorTileRoute = exports.createVectorTileRoute = flow.define(
 
     //Create Route for this table
     this.app.all(route, cacher.cache('day'), function (req, res) {
-
-      //Start Timer to measure response speed for tile requests.
-      var startTime = Date.now();
-
-      var args = common.getArguments(req);
-
-      //If user passes in where clause or fields, then build the query here and set it with the table property of postgis_setting
-      if (args.fields || args.where) {
-        //Validate where - TODO
-
-        //If a where clause was passed in, and we're using a postgis datasource, allow it
-        if (_self.settings.mapnik_datasource.type.toLowerCase() == 'postgis') {
-          _self.settings.mapnik_datasource.table = (args.fields ? '(SELECT ' + _self.settings.routeProperties.geom_field + (args.fields ? ',' + args.fields : '') + ' from "' + _self.settings.routeProperties.table + '"' + (args.where ? ' WHERE ' + args.where : '') + ') as "' + _self.settings.routeProperties.table + '"' : '"' + _self.settings.routeProperties.table + '"');
-        }
-      }
-
-      //Make the mapnik datasource.  We wait until now in case the table definition changes if a where clause is passed in above.
-      _self.mapnikDatasource = (_self.settings.mapnik_datasource.describe ? _self.settings.mapnik_datasource : new mapnik.Datasource(_self.settings.mapnik_datasource));
-
-
-      try {
-        //create map
-        var map = new mapnik.Map(256, 256, mercator.proj4);
-
-        var layer = new mapnik.Layer(_self.settings.routeProperties.name, ((_self.epsg && (_self.epsg == 3857 || _self.epsg == 3587)) ? mercator.proj4 : geographic.proj4));
-
-        var label_point_layer;
-        if(args.labelpoints && _self.settings.mapnik_datasource.type.toLowerCase() == 'postgis') {
-          //If user specifies label points to be created, then create another layer in this vector tile that stores the centroid to use as a label point.
-
-          //The only difference in the datasource is the table parameter, which is either a table name, or a sub query that allows you specify a WHERE clause.
-          _self.settings.mapnik_datasource.table = (args.fields ? '(SELECT ' + ('ST_PointOnSurface(' + _self.settings.routeProperties.geom_field + ') as geom' ) + (args.fields ? ',' + args.fields : '')  + ' from "' + _self.settings.routeProperties.table + '"' + (args.where ? ' WHERE ' + args.where : '') + ') as "' + _self.settings.routeProperties.table + "_label" + '"' : '"' + _self.settings.routeProperties.table + '"');
-
-          //Make a new Mapnik datasource object
-          _self.mapnikDatasource_label = (_self.settings.mapnik_datasource.describe ? _self.settings.mapnik_datasource : new mapnik.Datasource(_self.settings.mapnik_datasource));
-
-
-          label_point_layer = new mapnik.Layer(_self.settings.routeProperties.name + "_label", ((_self.epsg && (_self.epsg == 3857 || _self.epsg == 3587)) ? mercator.proj4 : geographic.proj4));
-          label_point_layer.datasource = _self.mapnikDatasource_label;
-          label_point_layer.styles = [_self.settings.routeProperties.table, 'default'];
-
-          //Add label layer
-          map.add_layer(label_point_layer);
-        }
-
-        var bbox = mercator.xyz_to_envelope(+req.param('x'), +req.param('y'), +req.param('z'), false);
-
-        layer.datasource = _self.mapnikDatasource;
-        layer.styles = [_self.settings.routeProperties.table, 'default'];
-
-        map.bufferSize = 10;
-
-        map.add_layer(layer);
-
-        console.log(map.toXML());
-
-        //From Tilelive-Bridge - getTile
-        // set source _maxzoom cache to prevent repeat calls to map.parameters
-        if (_self._maxzoom === undefined) {
-          _self._maxzoom = map.parameters.maxzoom ? parseInt(map.parameters.maxzoom, 10) : 14;
-        }
-
-        var opts = {};
-        // use tolerance of 32 for zoom levels below max
-        opts.tolerance = req.param('z') < _self._maxzoom ? 32 : 0;
-        // make larger than zero to enable
-        opts.simplify = 0;
-        // 'radial-distance', 'visvalingam-whyatt', 'zhao-saalfeld' (default)
-        opts.simplify_algorithm = 'radial-distance';
-
-        res.setHeader('Content-Type', 'application/x-protobuf');
-
-        map.extent = bbox;
-        // also pass buffer_size in options to be forward compatible with recent node-mapnik
-        // https://github.com/mapnik/node-mapnik/issues/175
-        opts.buffer_size = map.bufferSize;
-
-        map.render(new mapnik.VectorTile(+req.param('z'), +req.param('x'), +req.param('y')), opts, function (err, image) {
-
-          if (err || !image) {
-            res.removeHeader('Content-Encoding');
-            res.writeHead(500, {
-              'Content-Type': 'application/x-protobuf'
-            });
-            res.end();
-            return;
-          }
-
-          // Fake empty RGBA to the rest of the tilelive API for now.
-          image.isSolid(function (err, solid, key) {
-            if (err) {
-              res.writeHead(500, {
-                'Content-Type': 'text/plain'
-              });
-
-              res.end(err.message);
-              return;
-            }
-            // Solid handling.
-            var done = function (err, buffer) {
-              if (err) {
-                res.writeHead(500, {
-                  'Content-Type': 'text/plain'
-                });
-
-                res.end(err.message);
-                return;
-              }
-
-              if (solid === false) {
-                var duration = Date.now() - startTime;
-                _self.performanceObject.times.push(duration);
-
-                res.send(buffer); //return response
-                return;
-              }
-
-              // Empty tiles are equivalent to no tile.
-              if (_self._blank || !key) {
-                res.removeHeader('Content-Encoding');
-                res.writeHead(404, {
-                  'Content-Type': 'application/octet-stream'
-                });
-
-
-                res.end(); //new Buffer('Tile is blank or does not exist', "utf-8")
-                return;
-              }
-
-              // Fake a hex code by md5ing the key.
-              var mockrgb = crypto.createHash('md5').update(buffer).digest('hex').substr(0, 6);
-              buffer.solid = [parseInt(mockrgb.substr(0, 2), 16), parseInt(mockrgb.substr(2, 2), 16), parseInt(mockrgb.substr(4, 2), 16), 1].join(',');
-              res.send(buffer);
-
-            };
-
-            //Compress if they ask for it.
-            if(res.req.headers["accept-encoding"] && res.req.headers["accept-encoding"].indexOf("gzip") > -1){
-              res.setHeader('content-encoding', 'gzip');
-              zlib.gzip(image.getData(), done);
-            }else{
-              done(null, image.getData());
-            }
-          });
-        });
-
-      } catch (err) {
-        res.writeHead(500, {
-          'Content-Type': 'text/plain'
-        });
-
-        res.end(err.message);
-      }
+      generateTile(_self, req, res);
     });
 
     console.log("Created vector tile service: " + route);
     VectorTileRoutes.push({ name: _self.settings.routeProperties.name, route: route, type: "Multi Tile", source: _self.settings.routeProperties.source});
   });
+
+var createDynamicVectorTileRoute = function(app, performanceObject) {
+  var dynamicRoute = '/services/postgis/:table/:geomcolumn/vector-tiles/:z/:x/:y.*';
+  app.all(dynamicRoute, cacher.cache('day'), function(req, res) {
+    common.getSpatialTableInfo(req.params.table, function(err, item) {
+      var options = {
+        settings: createTileSettings(
+            [item.table, item.geometry_column].join('_'),
+            item,
+            settings),
+        performanceObject: performanceObject
+      };
+      generateTile(options, req, res);
+    });
+  });
+};

@@ -207,6 +207,31 @@ common.findSpatialTables = function (app, callback) {
     });
 };
 
+common.getSpatialTableInfo = function (spatialTable, callback) {
+    var query = {
+        text: "SELECT * FROM geometry_columns WHERE f_table_name = $1",
+        values: [spatialTable]
+    };
+
+    this.executePgQuery(query, function(err, result) {
+        if (err) {
+            console.log([
+                'Could not read spatial information for: ' + spatialTable,
+                err.text
+            ].join('\n'));
+            return;
+        }
+        var item = result.rows[0];
+        var spTable = {
+            table: item.f_table_name,
+            geometry_column: item.f_geometry_column,
+            srid: item.srid,
+            type: item.type
+        };
+        callback(err, spTable);
+    });
+};
+
 //Utilities
 common.log = function (message) {
     //Write to console
