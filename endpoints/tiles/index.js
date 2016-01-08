@@ -1626,6 +1626,19 @@ var createDynamicVectorTileRoute = function(app, performanceObject) {
   var dynamicRoute = '/services/postgis/:table/:geomcolumn/vector-tiles/:z/:x/:y.*';
   app.all(dynamicRoute, cacher.cache('day'), function(req, res) {
     common.getSpatialTableInfo(req.params.table, function(err, item) {
+      if (err) {
+        res.status(500).json({message: err.text});
+        return;
+      }
+      if (typeof(item) == 'undefined') {
+        var err = {
+          message: 'Table ' + req.params.table + ' was not found'
+        };
+        console.log(err.message);
+        res.status(404).json(err);
+        return;
+      }
+
       var options = {
         settings: createTileSettings(
             [item.table, item.geometry_column].join('_'),

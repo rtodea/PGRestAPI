@@ -209,7 +209,13 @@ common.findSpatialTables = function (app, callback) {
 
 common.getSpatialTableInfo = function (spatialTable, callback) {
     var query = {
-        text: "SELECT * FROM geometry_columns WHERE f_table_name = $1",
+        text: [
+            'SELECT gc.*',
+            'FROM geometry_columns gc',
+            'JOIN layers_information li ON gc.f_table_name = li.name',
+            'WHERE f_table_name = $1',
+            'AND not li.deleted'
+        ].join(' '),
         values: [spatialTable]
     };
 
@@ -219,9 +225,16 @@ common.getSpatialTableInfo = function (spatialTable, callback) {
                 'Could not read spatial information for: ' + spatialTable,
                 err.text
             ].join('\n'));
+            callback(err);
             return;
         }
+
         var item = result.rows[0];
+        if (typeof(item) == 'undefined') {
+            callback(err, item);
+            return;
+        }
+
         var spTable = {
             table: item.f_table_name,
             geometry_column: item.f_geometry_column,
